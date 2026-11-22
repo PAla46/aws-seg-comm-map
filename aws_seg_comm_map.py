@@ -12,13 +12,18 @@ them with *separate* diagrams because the single "whole account" topology is
 what mermaid.live refuses to load:
 
   1. "Is segmentation in place?"         -> one .mmd per VPC, subnet-tier only.
-  2. "Which applications can talk to     -> one .mmd per security group that
-     which applications?"                    participates in a rule.
+  2. "Which applications can talk to     -> one .mmd per VPC, drawn at
+     which applications?"                    security-group level.
 
 The key insight: route tables describe *routing* (subnet tiers, gateway paths),
 but configured app-to-app reachability lives in *security group references*
 (sg-a allows ingress from sg-b on :5432). Splitting by route table cannot show
-the app graph; splitting by security group can.
+the app graph; the security-group reference graph can -- and because SG
+references are always intra-VPC, one diagram per VPC is the whole story, and it
+is small enough to load in mermaid.live (SGs, not ENIs / instances / endpoints).
+
+`--sg-drilldowns` additionally emits one per-security-group drill-down diagram
+under <out>/comms/ for when the lead wants to zoom into a single application.
 
 It only calls Describe* / List* APIs. It never creates, modifies or deletes.
 """
@@ -982,7 +987,63 @@ def _emit_comm_peer(b: Mermaid, inv: dict, key: str) -> None:
         b.node(key, cidr, "box", "cidr", 40)
 
 
-def render_exposure(inv: dict, edges_by_sg: Dict[str, List[dict]]) -> str:
+def render_vpc_comm(inv: dict, vpc_id: str) -> str:
+    """The whole app-to-app graph for one VPC, at security-group granularity.
+
+    AWS security group references are always intra-VPC, so a VPC is a clean
+    partition: drawing the SG<->SG references of one VPC *is* the complete
+    "who can talk to whom" picture for that VPC, and it is small enough to load
+    in mermaid.live (SGs, not ENIs / instances / endpoints).
+    """
+    vpc = inv["vpcs"][vpc_id]
+    sgs_here = {sg["id"]: sg for sg in inv["sgs"].values() if sg["vpc_id"] == vpc_id}
+
+    involved: set = set()
+    edges: List[Tuple[str, str, str]] = []
+    seen: set = set()
+
+    def exposed(sg: dict) -> bool:
+        return any(r["cidr"] in INTERNET_CIDRS for r in sg["ingress"])
+
+    for sg in sgs_here.values():
+        me = sg["id"]
+        for rule in sg["ingress"]:
+            if rule["sg_id"] and rule["sg_id"] in sgs_here:
+                involved.add(me)
+                involved.add(rule["sg_id"])
+                key = (rule["sg_id"], me, port_label(rule))
+                if key not in seen:
+                    seen.add(key)
+                    edges.append(key)
+        for rule in sg["egress"]:
+            if rule["sg_id"] and rule["sg_id"] in sgs_here:
+                involved.add(me)
+                involved.add(rule["sg_id"])
+                key = (me, rule["sg_id"], port_label(rule))
+                if key not in seen:
+                    seen.add(key)
+                    edges.append(key)
+
+    b = Mermaid(f"application communication \u2014 {vpc['name'] or vpc['id']} (security groups)")
+    if not involved:
+        b.node("none", "no security-group-to-security-group references in this VPC", "round", "private", 120)
+        return b.render()
+
+    for sg_id in sorted(involved):
+        sg = sgs_here[sg_id]
+        lines = [f"SG {sg['name']}", sg_id]
+        members = inv["members"].get(sg_id, [])
+        if members:
+            lines.append(", ".join(members[:3]) + (" ..." if len(members) > 3 else ""))
+        b.node("sg-" + sg_id, "\n".join(lines), "stadium", "exposed" if exposed(sg) else "sg", 120)
+
+    for src, dst, label in sorted(edges):
+        b.edge("sg-" + src, "sg-" + dst, label)
+
+    return b.render()
+
+
+def render_exposure(inv: dict) -> str:
     b = Mermaid("internet exposure \u2014 security groups reachable from 0.0.0.0/0")
     b.node("internet", "INTERNET", "stadium", "internet")
 
@@ -1084,15 +1145,15 @@ def write_evidence(inv: dict, out: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def emit(inv: dict, out: str) -> Dict[str, int]:
+def emit(inv: dict, out: str, sg_drilldowns: bool = False) -> Dict[str, int]:
     os.makedirs(out, exist_ok=True)
     link(inv)
-    edges_by_sg, sg_sg = build_comm_graph(inv)
 
     written: List[str] = []
 
     def save(name: str, content: str) -> None:
         path = os.path.join(out, name)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(content)
         written.append(name)
@@ -1100,24 +1161,32 @@ def emit(inv: dict, out: str) -> Dict[str, int]:
     save("00-overview.mmd", render_overview(inv))
 
     for vpc in sorted(inv["vpcs"].values(), key=lambda v: v["id"]):
-        save(f"10-seg-{slug(vpc['name'] or vpc['id'], 40)}.mmd", render_vpc_seg(inv, vpc["id"]))
+        stem = slug(vpc["name"] or vpc["id"], 40)
+        save(f"10-seg-{stem}.mmd", render_vpc_seg(inv, vpc["id"]))
+        save(f"20-comms-{stem}.mmd", render_vpc_comm(inv, vpc["id"]))
 
-    for sg_id in sorted(sg_sg):
-        if sg_is_interesting(edges_by_sg, sg_id):
+    save("21-internet-exposure.mmd", render_exposure(inv))
+
+    if sg_drilldowns:
+        edges_by_sg, sg_sg = build_comm_graph(inv)
+        for sg_id in sorted(sg_sg):
+            if not sg_is_interesting(edges_by_sg, sg_id):
+                continue
             sg = inv["sgs"].get(sg_id)
             if sg is None:
                 continue
-            save(f"20-comms-{slug(sg['name'] or sg_id, 40)}-{sg_id}.mmd", render_sg_comm(inv, sg_id, edges_by_sg))
-
-    save("21-internet-exposure.mmd", render_exposure(inv, edges_by_sg))
+            save(
+                f"comms/{slug(sg['name'] or sg_id, 40)}-{sg_id}.mmd",
+                render_sg_comm(inv, sg_id, edges_by_sg),
+            )
 
     write_evidence(inv, out)
-    write_start_here(inv, out, written, sg_sg)
+    write_start_here(inv, out, written, sg_drilldowns)
 
-    return {"files": len(written), "vpc_diagrams": len(inv["vpcs"]), "comms_diagrams": len([w for w in written if w.startswith("20-")])}
+    return {"files": len(written), "vpcs": len(inv["vpcs"]), "drilldowns": sg_drilldowns}
 
 
-def write_start_here(inv: dict, out: str, written: List[str], sg_sg: set) -> None:
+def write_start_here(inv: dict, out: str, written: List[str], sg_drilldowns: bool) -> None:
     lines = [
         "# Start here",
         "",
@@ -1133,16 +1202,24 @@ def write_start_here(inv: dict, out: str, written: List[str], sg_sg: set) -> Non
         "| Overview | `00-overview.mmd` | The whole account: VPCs, TGWs, peerings, VPN. |",
         "| Segmentation | `10-seg-*.mmd` | One per VPC. Subnets coloured public/private/isolated, "
         "with route table + NACL + the default route that proves the tier. |",
-        "| Communication | `20-comms-*.mmd` | One per security group that talks to another security "
-        "group. Shows *which applications can reach which* and on what port. |",
+        "| Communication | `20-comms-*.mmd` | One per VPC, drawn at security-group level: the whole "
+        "app-to-app graph, with ports on the arrows. |",
         "| Exposure | `21-internet-exposure.mmd` | Every security group with an ingress rule from "
         "0.0.0.0/0 or ::/0. |",
+    ]
+    if sg_drilldowns:
+        lines.append(
+            "| Drill-downs | `comms/<sg>-<id>.mmd` | One per security group (the `--sg-drilldowns` "
+            "output): who can reach this one SG, and who it can reach. |"
+        )
+    lines += [
         "",
         "## How to read a communication diagram",
         "",
-        "The hub (blue) is the security group you are inspecting. An arrow **into** the hub is a rule "
-        "that lets the source reach it; an arrow **out** of the hub is a rule that lets it reach the "
-        "destination. Labels are port/protocol (`:5432/tcp`, `:443/tcp`, `all`).",
+        "Each node is a security group. An arrow `A --> B :5432/tcp` means B's rules let A reach B "
+        "on 5432 (or A's rules let A send to B). Red nodes are also reachable from the internet. "
+        "Node labels list the EC2/ALB/RDS resources that use the group, so `sg-0abc…` reads as "
+        "\"the database tier\".",
         "",
         "This is **configured reachability**, not observed traffic. Route tables and security groups "
         "say what the network *allows*; only VPC Flow Logs say what actually flows.",
@@ -1252,6 +1329,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default="seg-comm-map", help="output directory")
     p.add_argument("--profile", default="", help="AWS profile name (default: the CloudShell session)")
     p.add_argument("--demo", action="store_true", help="run the bundled synthetic scenario (no AWS)")
+    p.add_argument(
+        "--sg-drilldowns",
+        action="store_true",
+        help="additionally emit one per-security-group drill-down diagram under <out>/comms/",
+    )
     return p
 
 
@@ -1281,7 +1363,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         collector = Collector(regions, profile=args.profile)
         inv = collector.collect()
 
-    result = emit(inv, args.out)
+    result = emit(inv, args.out, sg_drilldowns=args.sg_drilldowns)
 
     print("=" * 70)
     print(f"Account {inv['account_id'] or 'unknown'}  regions: {', '.join(inv['regions']) or '-'}")
@@ -1290,8 +1372,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"{len(inv['rtbs'])} route table(s), {len(inv['sgs'])} security group(s)"
     )
     print(
-        f"  written: {result['files']} file(s) -> {result['vpc_diagrams']} segmentation "
-        f"diagram(s), {result['comms_diagrams']} communication diagram(s)"
+        f"  written: {result['files']} file(s) \u2014 overview, {result['vpcs']} segmentation + "
+        f"{result['vpcs']} communication diagram(s), exposure, index"
+        + (" + SG drill-downs" if result["drilldowns"] else "")
     )
     if inv["errors"]:
         print(f"  collection warnings: {len(inv['errors'])} (see START-HERE.md)")

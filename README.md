@@ -32,7 +32,7 @@ they have to be drawn from two different axes:
 | Question | The data that answers it | This tool emits |
 | --- | --- | --- |
 | "Is segmentation in place?" | Subnets + route tables + NACLs | one `10-seg-*.mmd` per VPC |
-| "Which applications can talk to which?" | Security group references | one `20-comms-*.mmd` per SG |
+| "Which applications can talk to which?" | Security group references | one `20-comms-*.mmd` per VPC (SG-level) |
 
 **Route tables describe routing, not conversation.** A route table says
 "traffic for `10.x` goes via the transit gateway"; it never says
@@ -54,9 +54,10 @@ small.
 <out>/
   00-overview.mmd            account overview: VPCs, TGWs, peerings, VPN
   10-seg-<vpc>.mmd           one per VPC: subnet tiers + gateways + routes
-  20-comms-<sg>-<id>.mmd     one per security group with an app-to-app rule
+  20-comms-<vpc>.mmd         one per VPC: the SG-level app-to-app graph
   21-internet-exposure.mmd   every SG reachable from 0.0.0.0/0 or ::/0
   START-HERE.md              index + how to read each family
+  comms/<sg>-<id>.mmd        (only with --sg-drilldowns) one per security group
   reports/
     subnets.csv              every subnet and its derived classification
     route-tables.csv         every route, normalised
@@ -79,11 +80,16 @@ hop. Classification comes from the route table, never from the subnet name.
 
 ### `20-comms-*` — application communication
 
-The blue hub node is the security group you are inspecting. An arrow **into**
-the hub is a rule that lets the source reach it; an arrow **out** is a rule that
-lets it reach the destination. Labels are port/protocol (`:5432/tcp`, `:443/tcp`,
-`all`). The node lists who uses it (`used by: EC2 app-01, RDS prod-postgres`),
-which is what turns "sg-0abc…" into "the database tier".
+One diagram per VPC, drawn at **security-group level** (not resource level), so
+it is small enough to load in mermaid.live while still showing the whole app
+graph. Each node is a security group; an arrow `A --> B :5432/tcp` means B's
+rules let A reach B on 5432 (or A's rules let A send to B). Red nodes are also
+reachable from the internet. Node labels list the EC2/ALB/RDS resources that use
+the group, so `sg-0abc…` reads as "the database tier".
+
+For a single-application zoom, `--sg-drilldowns` writes one `comms/<sg>-<id>.mmd`
+per security group: the hub node and its full neighbourhood (who can reach it
+*and* who it can reach).
 
 ### `21-internet-exposure`
 
@@ -103,6 +109,9 @@ python3 aws_seg_comm_map.py --regions eu-west-1,ap-south-1 --out ./map
 
 # a specific profile (CloudShell uses the session by default)
 python3 aws_seg_comm_map.py --all-regions --profile audit
+
+# per-security-group drill-downs, too (a comms/<sg>-<id>.mmd per SG)
+python3 aws_seg_comm_map.py --all-regions --out ./map --sg-drilldowns
 
 # no AWS? verify the tool works first:
 python3 aws_seg_comm_map.py --demo --out ./demo
