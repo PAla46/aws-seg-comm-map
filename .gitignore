@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.demo/
+demo/
+seg-comm-map/
+*.cache
