@@ -503,8 +503,8 @@ class Collector:
                 "vpc_id": sg.get("VpcId", ""),
                 "name": sg.get("GroupName", ""),
                 "description": sg.get("Description", ""),
-                "ingress": [_norm_sg_rule(r) for r in sg.get("IpPermissions", []) or []],
-                "egress": [_norm_sg_rule(r) for r in sg.get("IpPermissionsEgress", []) or []],
+                "ingress": _flatten_rules(sg.get("IpPermissions")),
+                "egress": _flatten_rules(sg.get("IpPermissionsEgress")),
             }
 
         for eni in call("describe_network_interfaces", "NetworkInterfaces"):
@@ -612,6 +612,15 @@ def _int(value) -> int:
         return int(value)
     except (TypeError, ValueError):
         return -1
+
+
+def _flatten_rules(perms) -> List[dict]:
+    """One ``IpPermissions`` block expands to one rule per source (a list of
+    rules), so flatten the blocks into a single flat list of rule dicts."""
+    out: List[dict] = []
+    for perm in perms or []:
+        out.extend(_norm_sg_rule(perm))
+    return out
 
 
 # --------------------------------------------------------------------------- #
