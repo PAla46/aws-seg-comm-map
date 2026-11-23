@@ -71,6 +71,17 @@ def trunc(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "\u2026"
 
 
+# Edge labels are unquoted (`-->|label|`), and Mermaid v11 rejects raw
+# brackets/parentheses there. Node labels are already inside `["..."]`, so they
+# do not need this and stay readable in the raw file.
+_EDGE_ESCAPES = {"(": "#40;", ")": "#41;", "[": "#91;", "]": "#93;"}
+_EDGE_RE = re.compile("[" + re.escape("".join(_EDGE_ESCAPES)) + "]")
+
+
+def esc_edge(text: object) -> str:
+    return _EDGE_RE.sub(lambda m: _EDGE_ESCAPES[m.group()], esc(text))
+
+
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -144,7 +155,7 @@ class Mermaid:
 
     def edge(self, src: str, dst: str, label: str = "", style: str = "-->") -> None:
         a, b = self.nid(src), self.nid(dst)
-        body = f"  {a} {style}|{esc(trunc(label, 60))}| {b}" if label else f"  {a} {style} {b}"
+        body = f"  {a} {style}|{esc_edge(trunc(label, 60))}| {b}" if label else f"  {a} {style} {b}"
         if body in self._edges:
             return
         self._edges.add(body)
