@@ -168,6 +168,35 @@ fewer human-readable "used by" names.
 
 ---
 
+## Rendering to SVG / PNG (batch)
+
+`render-all-pngs.sh` turns every `.mmd` in a directory into an **SVG** plus a
+**high-resolution PNG**. It needs `mermaid-cli` and a headless browser:
+
+```bash
+npm install -g @mermaid-js/mermaid-cli
+
+./render-all-pngs.sh ./seg-comm-map                 # -> ./seg-comm-map/png, 2x
+./render-all-pngs.sh ./seg-comm-map ./png 3         # 3x
+./render-all-pngs.sh ~/Downloads/output/dionysus/output ~/Downloads/png
+```
+
+It renders the SVG first (resolution-independent, ideal for zooming), then
+rasterises to PNG with `rsvg-convert` when available and falls back to `mmdc`.
+The zoom is capped at 32000 px per side, so a very wide diagram is scaled down
+instead of failing.
+
+Notes:
+
+- Rendering is **local** — nothing is uploaded. Do **not** use the public
+  `mermaid.ink` / `kroki` services for audit data: the diagrams contain account
+  ids, security-group names and CIDRs.
+- A detailed per-CIDR segmentation diagram can be tens of thousands of px wide.
+  For reading, prefer the high-granularity route-table view (`10-seg-<vpc>.mmd`);
+  keep the detailed one for zooming/evidence.
+
+---
+
 ## Limitations
 
 - **Configured, never observed.** These diagrams show what routing + security
