@@ -181,10 +181,9 @@ npm install -g @mermaid-js/mermaid-cli
 ./render-all-pngs.sh ~/Downloads/output/dionysus/output ~/Downloads/png
 ```
 
-It renders the SVG first (resolution-independent, ideal for zooming), then
-rasterises to PNG with `rsvg-convert` when available and falls back to `mmdc`.
-The zoom is capped at 32000 px per side, so a very wide diagram is scaled down
-instead of failing.
+It writes a resolution-independent SVG and a PNG rasterised by `mmdc`
+(Chromium), which is what renders Mermaid's HTML labels. The zoom is capped at
+32000 px per side, so a very wide diagram is scaled down instead of failing.
 
 Notes:
 

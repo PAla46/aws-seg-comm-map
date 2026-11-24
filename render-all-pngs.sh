@@ -13,9 +13,10 @@
 # Requires mermaid-cli (mmdc) and a headless browser:
 #   npm install -g @mermaid-js/mermaid-cli
 #
-# PNG rasterisation uses rsvg-convert when present (best for very wide charts),
-# otherwise falls back to mmdc itself. The zoom is capped so no side exceeds
-# 32000 px (rsvg-convert's hard limit; also keeps memory sane).
+# The SVG is written as a bonus; the PNG is always rasterised by mmdc (Chromium),
+# which renders Mermaid's HTML/<foreignObject> labels. Do NOT use rsvg-convert:
+# it drops <foreignObject> and produces text-less PNGs. The zoom is capped so no
+# side exceeds 32000 px (keeps memory sane).
 
 set -uo pipefail
 
@@ -45,9 +46,6 @@ for c in chromium chromium-browser google-chrome google-chrome-stable; do
   fi
 done
 
-have_rsvg=0
-command -v rsvg-convert >/dev/null 2>&1 && have_rsvg=1
-
 total=0
 failed=0
 while IFS= read -r -d '' f; do
@@ -59,16 +57,23 @@ while IFS= read -r -d '' f; do
   total=$((total + 1))
   printf '[%d] %s\n' "$total" "$rel"
 
-  # 1) SVG first: always reliable, and resolution independent.
-  if ! mmdc -i "$f" -o "$sub/$name.svg" -b white -p "$CFG" -q 2>/dev/null; then
+  # 1) SVG first: always reliable, and resolution independent. Retry once:
+  #    headless Chrome occasionally flakes under load.
+  svg_ok=0
+  for _ in 1 2; do
+    if mmdc -i "$f" -o "$sub/$name.svg" -b white -p "$CFG" -q 2>/dev/null; then svg_ok=1; break; fi
+    sleep 1
+  done
+  if [ "$svg_ok" != 1 ]; then
     echo "    ! SVG failed: $rel" >&2
     failed=$((failed + 1))
     continue
   fi
 
-  # 2) Natural size from the SVG viewBox.
-  read -r W H < <(grep -oE 'viewBox="0 0 [0-9.]+ [0-9.]+"' "$sub/$name.svg" \
-    | head -1 | sed -E 's/.*0 0 ([0-9.]+) ([0-9.]+)/\1 \2/')
+  # 2) Natural size from the SVG viewBox. The origin is not always 0 0, so take
+  #    the 3rd and 4th numbers (width, height), not the first two.
+  read -r _vx _vy W H < <(grep -oE 'viewBox="[^"]*"' "$sub/$name.svg" \
+    | head -1 | sed -E 's/[^0-9.-]+/ /g')
   W=${W%%.*}; W=${W%%[!0-9]*}
   H=${H%%.*}; H=${H%%[!0-9]*}
   [ -z "${W:-}" ] && W=1600
@@ -85,13 +90,17 @@ while IFS= read -r -d '' f; do
     fi
   fi
 
-  # 4) PNG.
-  if [ "$have_rsvg" = 1 ]; then
-    rsvg-convert -z "$eff" -o "$sub/$name.png" "$sub/$name.svg" \
-      || { echo "    ! PNG failed: $rel" >&2; failed=$((failed + 1)); }
-  else
-    mmdc -i "$f" -o "$sub/$name.png" -b white -w "$W" -H "$H" -s "$eff" -p "$CFG" -q 2>/dev/null \
-      || { echo "    ! PNG failed: $rel" >&2; failed=$((failed + 1)); }
+  # 4) PNG must come from mmdc (Chromium) so the HTML/<foreignObject> labels
+  #    render. rsvg-convert would drop them and leave text-less boxes.
+  png_ok=0
+  for _ in 1 2 3; do
+    if mmdc -i "$f" -o "$sub/$name.png" -b white -w "$W" -H "$((H + 50))" -s "$eff" \
+        -p "$CFG" -q 2>/dev/null; then png_ok=1; break; fi
+    sleep 1
+  done
+  if [ "$png_ok" != 1 ]; then
+    echo "    ! PNG failed: $rel" >&2
+    failed=$((failed + 1))
   fi
 done < <(find "$IN" -type f -name '*.mmd' -print0 | sort -z)
 
