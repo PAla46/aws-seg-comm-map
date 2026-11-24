@@ -107,6 +107,7 @@ STYLES = {
     "cidr": "fill:#f8fafc,stroke:#94a3b8,color:#0f172a",
     "exposed": "fill:#fee2e2,stroke:#b91c1c,color:#450a0a",
     "vpc": "fill:#eef2ff,stroke:#4f46e5,color:#1e1b4b",
+    "dim": "fill:#f8fafc,stroke:#cbd5e1,color:#94a3b8",
 }
 
 _SHAPES = {
@@ -133,6 +134,8 @@ class Mermaid:
         self._class_of: Dict[str, str] = {}
         self._classes: set = set()
         self._sg_counter = 0
+        self._edge_count = 0
+        self._link_styles: Dict[str, List[int]] = {}
 
     def nid(self, key: str) -> str:
         if key not in self._ids:
@@ -153,13 +156,22 @@ class Mermaid:
             self._class_of[nid] = cls
         return nid
 
-    def edge(self, src: str, dst: str, label: str = "", style: str = "-->") -> None:
+    def has(self, key: str) -> bool:
+        return key in self._ids and self._ids[key] in self._defined
+
+    def edge(
+        self, src: str, dst: str, label: str = "", style: str = "-->", color: str = ""
+    ) -> None:
         a, b = self.nid(src), self.nid(dst)
         body = f"  {a} {style}|{esc_edge(trunc(label, 60))}| {b}" if label else f"  {a} {style} {b}"
         if body in self._edges:
             return
         self._edges.add(body)
         self._lines.append(body)
+        index = self._edge_count
+        self._edge_count += 1
+        if color:
+            self._link_styles.setdefault(color, []).append(index)
 
     def group(self, key: str, label: str) -> "_Group":
         return _Group(self, key, label)
@@ -171,6 +183,9 @@ class Mermaid:
         out.extend(self._lines)
         for name in sorted(self._classes):
             out.append(f"  classDef {name} {STYLES[name]};")
+        for color in sorted(self._link_styles):
+            indices = ",".join(str(i) for i in self._link_styles[color])
+            out.append(f"  linkStyle {indices} stroke:{color},stroke-width:2px;")
         return "\n".join(out) + "\n"
 
 
@@ -784,6 +799,92 @@ def sg_is_interesting(edges_by_sg: Dict[str, List[dict]], sg_id: str) -> bool:
 # Renderers
 # --------------------------------------------------------------------------- #
 
+# ---- edge colours --------------------------------------------------------- #
+# Colours are semantic, not per-resource: a 58-SG graph cannot carry 58 distinct
+# colours, but it can carry "management / data / web / other".
+FOCUS_COLOR = "#ea580c"  # the --focus-sg highlight
+DIM_COLOR = "#cbd5e1"    # everything else when a focus SG is set
+
+_MGMT_PORTS = {22, 3389, 5900, 5901}
+_DATA_PORTS = {1433, 1521, 3306, 5432, 5439, 6379, 9042, 27017, 11211, 9200, 9300}
+_WEB_PORTS = {80, 443, 8000, 8080, 8443, 9443}
+_PORT_RE = re.compile(r":(\d+)")
+
+_SEG_COLORS = {
+    "igw": "#2563eb", "internet": "#2563eb", "nat": "#0e7490",
+    "tgw": "#7c3aed", "pcx": "#c026d3", "vgw": "#4338ca",
+    "vpce": "#0f766e", "eni": "#64748b",
+}
+
+# Route target kind -> node-key prefix. The node key is what arrows point at.
+_ROUTE_KEY_PREFIX = {
+    "igw": "igw-", "nat": "nat-", "vgw": "vgw-",
+    "tgw": "tgw-", "pcx": "pcx-", "vpce": "vpce-",
+}
+
+_GATEWAY_CLASS = {
+    "igw": "internet", "nat": "private", "vgw": "vgw",
+    "tgw": "tgw", "pcx": "peering", "vpce": "endpoint",
+}
+
+
+def seg_color_for(dst_key: str) -> str:
+    return _SEG_COLORS.get(dst_key.split("-", 1)[0], "#64748b")
+
+
+def comm_color_for(label: str) -> str:
+    low = (label or "").lower()
+    if "all" in low:
+        return "#64748b"
+    ports = {int(p) for p in _PORT_RE.findall(low)}
+    if ports & _MGMT_PORTS:
+        return "#dc2626"
+    if ports & _DATA_PORTS:
+        return "#15803d"
+    if ports & _WEB_PORTS:
+        return "#2563eb"
+    return "#b45309"
+
+
+def route_dst_key(kind: str, target: str) -> Optional[str]:
+    prefix = _ROUTE_KEY_PREFIX.get(kind)
+    if not prefix or not target:
+        return None
+    return prefix + target
+
+
+def agg_route_label(group: dict) -> str:
+    """One label for every route to the same target: the default + a count."""
+    default = group.get("default")
+    others = group.get("others") or []
+    if default is not None:
+        label = default["destination"]
+        if others:
+            label += f" (+{len(others)} more)"
+        return label
+    dests = sorted({r["destination"] for r in others})
+    if not dests:
+        return "route"
+    if len(dests) == 1:
+        return dests[0]
+    return f"{dests[0]} (+{len(dests) - 1} more)"
+
+
+def peer_label(key: str) -> str:
+    if key == "internet":
+        return "INTERNET"
+    if key.startswith("pl-"):
+        return "PREFIX LIST\n" + key[3:]
+    if key.startswith("cidr-"):
+        return key[5:]
+    return key
+
+
+def edge_color(src: str, dst: str, label: str, focus_key: str) -> str:
+    if focus_key:
+        return FOCUS_COLOR if focus_key in (src, dst) else DIM_COLOR
+    return comm_color_for(label)
+
 
 def render_overview(inv: dict) -> str:
     b = Mermaid("AWS network segmentation \u2014 account overview")
@@ -837,74 +938,121 @@ def render_overview(inv: dict) -> str:
     return b.render()
 
 
-def render_vpc_seg(inv: dict, vpc_id: str) -> str:
+def render_vpc_seg(inv: dict, vpc_id: str, mode: str = "high") -> str:
+    """One VPC, two granularities.
+
+    ``high`` (default) is route-table level: one box per route table (with its
+    subnets listed) and one aggregated arrow per (route table, gateway target).
+    This is what keeps a 16-subnet VPC from turning into a 40,000-px hairball.
+
+    ``low`` is subnet level with one arrow per route (/CIDR), i.e. the full
+    detail.
+    """
     vpc = inv["vpcs"][vpc_id]
-    b = Mermaid(f"segmentation \u2014 {vpc['name'] or vpc['id']}")
+    label = " (route tables)" if mode == "high" else " (subnets)"
+    b = Mermaid(f"segmentation \u2014 {vpc['name'] or vpc['id']}{label}")
     b.node("internet", "INTERNET", "stadium", "internet")
     if any(g["vpc_id"] == vpc_id for g in inv["vgws"].values()):
         b.node("onprem", "ON-PREMISES", "box", "onprem")
 
+    subs = [s for s in inv["subnets"].values() if s["vpc_id"] == vpc_id]
+    vpc_rtbs = [r for r in inv["rtbs"].values() if r["vpc_id"] == vpc_id]
+
     with b.group("vpc", f"VPC {vpc['name'] or vpc['id']} \u2014 {vpc_id}\n{vpc['cidr']}"):
-        # Transit gateways attached to this VPC (routes point at these).
-        for tgw in sorted(inv["tgws"].values(), key=lambda t: t["id"]):
-            if any(a.get("vpc_id") == vpc_id for a in tgw["attachments"]):
-                b.node("tgw-" + tgw["id"], f"TRANSIT GATEWAY\n{tgw['name'] or tgw['id']}", "hex", "tgw", 120)
-        for igw in sorted(
-            [i for i in inv["igws"].values() if i["vpc_id"] == vpc_id], key=lambda i: i["id"]
-        ):
-            b.node("igw-" + igw["id"], f"INTERNET GATEWAY\n{igw['id']}", "round", "internet", 120)
+        _draw_gateway_nodes(b, inv, vpc_id)
+        if mode == "high":
+            _emit_seg_rtb_nodes(b, inv, subs, vpc_rtbs)
+        else:
+            _emit_seg_subnet_nodes(b, inv, subs)
+        _emit_missing_gateways(b, vpc_rtbs)
 
-        for nat in sorted(
-            [n for n in inv["nats"].values() if n["vpc_id"] == vpc_id], key=lambda n: n["id"]
-        ):
+    if mode == "high":
+        _seg_rtb_edges(b, inv, vpc_id, subs, vpc_rtbs)
+    else:
+        _seg_subnet_edges(b, inv, vpc_id, subs)
+
+    _draw_igw_internet(b, inv, vpc_id)
+    return b.render()
+
+
+def _draw_gateway_nodes(b: Mermaid, inv: dict, vpc_id: str) -> None:
+    for tgw in sorted(inv["tgws"].values(), key=lambda t: t["id"]):
+        if any(a.get("vpc_id") == vpc_id for a in tgw["attachments"]):
+            b.node("tgw-" + tgw["id"], f"TRANSIT GATEWAY\n{tgw['name'] or tgw['id']}", "hex", "tgw", 120)
+    for igw in sorted([i for i in inv["igws"].values() if i["vpc_id"] == vpc_id], key=lambda i: i["id"]):
+        b.node("igw-" + igw["id"], f"INTERNET GATEWAY\n{igw['id']}", "round", "internet", 120)
+    for nat in sorted([n for n in inv["nats"].values() if n["vpc_id"] == vpc_id], key=lambda n: n["id"]):
+        b.node(
+            "nat-" + nat["id"],
+            f"NAT GATEWAY\n{nat['id']}\n{nat['state']} {nat['connect_type']}",
+            "round",
+            "private",
+            120,
+        )
+    for vgw in sorted([g for g in inv["vgws"].values() if g["vpc_id"] == vpc_id], key=lambda g: g["id"]):
+        b.node("vgw-" + vgw["id"], f"VPN GATEWAY\n{vgw['id']}", "round", "vgw", 120)
+        b.edge("vgw-" + vgw["id"], "onprem" if inv["vgws"] else "internet", "ipsec", color="#4338ca")
+    for pcx in sorted(
+        [p for p in inv["peerings"].values() if p["vpc_id"] == vpc_id or p["peer_vpc_id"] == vpc_id],
+        key=lambda p: p["id"],
+    ):
+        b.node("pcx-" + pcx["id"], f"VPC PEERING\n{pcx['id']}\n{pcx['status']}", "hex", "peering", 120)
+    for ep in sorted([e for e in inv["endpoints"].values() if e["vpc_id"] == vpc_id], key=lambda e: e["id"]):
+        b.node(
+            "vpce-" + ep["id"],
+            f"ENDPOINT {ep['service']}\n{ep['id']}\n{ep['type']}",
+            "hex",
+            "endpoint",
+            120,
+        )
+
+
+def _emit_missing_gateways(b: Mermaid, vpc_rtbs: List[dict]) -> None:
+    """Routes can point at gateways this VPC does not own; never dangle an arrow."""
+    seen: Dict[str, str] = {}
+    for rtb in vpc_rtbs:
+        for route in rtb["routes"]:
+            if route["state"] != "active":
+                continue
+            dst = route_dst_key(route["kind"], route["target_id"])
+            if dst:
+                seen[dst] = route["kind"]
+    for dst, kind in sorted(seen.items()):
+        if not b.has(dst):
             b.node(
-                "nat-" + nat["id"],
-                f"NAT GATEWAY\n{nat['id']}\n{nat['state']} {nat['connect_type']}",
-                "round",
-                "private",
-                120,
-            )
-
-        for vgw in sorted(
-            [g for g in inv["vgws"].values() if g["vpc_id"] == vpc_id], key=lambda g: g["id"]
-        ):
-            b.node("vgw-" + vgw["id"], f"VPN GATEWAY\n{vgw['id']}", "round", "vgw", 120)
-            b.edge("vgw-" + vgw["id"], "onprem" if inv["vgws"] else "internet", "ipsec")
-
-        for pcx in sorted(
-            [p for p in inv["peerings"].values() if p["vpc_id"] == vpc_id or p["peer_vpc_id"] == vpc_id],
-            key=lambda p: p["id"],
-        ):
-            b.node("pcx-" + pcx["id"], f"VPC PEERING\n{pcx['id']}\n{pcx['status']}", "hex", "peering", 120)
-
-        for ep in sorted(
-            [e for e in inv["endpoints"].values() if e["vpc_id"] == vpc_id], key=lambda e: e["id"]
-        ):
-            b.node(
-                "vpce-" + ep["id"],
-                f"ENDPOINT {ep['service']}\n{ep['id']}\n{ep['type']}",
+                dst,
+                f"{TARGET_PHRASE.get(kind, kind).upper()}\n{dst.split('-', 1)[1]}",
                 "hex",
-                "endpoint",
+                _GATEWAY_CLASS.get(kind, "private"),
                 120,
             )
 
-        subs = [s for s in inv["subnets"].values() if s["vpc_id"] == vpc_id]
-        for subnet in sorted(subs, key=_subnet_sort(inv)):
-            cls, default = classify(inv["rtbs"].get(subnet["rtb_id"]))
-            rtb = inv["rtbs"].get(subnet["rtb_id"], {})
-            nacl = subnet_nacl(inv, subnet)
-            lines = [
-                f"{cls.upper()} \u00b7 {subnet['name'] or subnet['id']}",
-                f"{subnet['id']} \u00b7 {subnet['cidr'] or 'no cidr'} \u00b7 {subnet['az'] or '?'}",
-            ]
-            if rtb:
-                lines.append(f"rtb: {rtb['name'] or rtb['id']}")
-            if nacl:
-                lines.append(f"nacl: {nacl['id']} ({nacl['in']} in / {nacl['out']} out)")
-            lines.append(classification_reason(cls, default))
-            b.node("subnet-" + subnet["id"], "\n".join(lines), "box", cls, 200)
 
-    # arrows: subnet -> next hop
+def _draw_igw_internet(b: Mermaid, inv: dict, vpc_id: str) -> None:
+    for igw in inv["igws"].values():
+        if igw["vpc_id"] == vpc_id:
+            b.edge("igw-" + igw["id"], "internet", "egress", color="#2563eb")
+            b.edge("internet", "igw-" + igw["id"], "ingress", color="#2563eb")
+
+
+def _emit_seg_subnet_nodes(b: Mermaid, inv: dict, subs: List[dict]) -> None:
+    for subnet in sorted(subs, key=_subnet_sort(inv)):
+        cls, default = classify(inv["rtbs"].get(subnet["rtb_id"]))
+        rtb = inv["rtbs"].get(subnet["rtb_id"], {})
+        nacl = subnet_nacl(inv, subnet)
+        lines = [
+            f"{cls.upper()} \u00b7 {subnet['name'] or subnet['id']}",
+            f"{subnet['id']} \u00b7 {subnet['cidr'] or 'no cidr'} \u00b7 {subnet['az'] or '?'}",
+        ]
+        if rtb:
+            lines.append(f"rtb: {rtb['name'] or rtb['id']}")
+        if nacl:
+            lines.append(f"nacl: {nacl['id']} ({nacl['in']} in / {nacl['out']} out)")
+        lines.append(classification_reason(cls, default))
+        b.node("subnet-" + subnet["id"], "\n".join(lines), "box", cls, 200)
+
+
+def _seg_subnet_edges(b: Mermaid, inv: dict, vpc_id: str, subs: List[dict]) -> None:
     for subnet in sorted(subs, key=_subnet_sort(inv)):
         rtb = inv["rtbs"].get(subnet["rtb_id"])
         if not rtb:
@@ -914,33 +1062,73 @@ def render_vpc_seg(inv: dict, vpc_id: str) -> str:
             if route["state"] != "active":
                 continue
             kind, target = route["kind"], route["target_id"]
-            label = route["destination"]
-            if kind == "igw" and target:
-                b.edge(src, "igw-" + target, label)
-                cls, _ = classify(rtb)
-                if cls == "public":
-                    b.edge("igw-" + target, src, f"inbound {subnet['cidr']}")
-            elif kind == "nat" and target:
-                b.edge(src, "nat-" + target, label)
-                igw = next((i for i in inv["igws"].values() if i["vpc_id"] == vpc_id and i["attached"]), None)
+            dst = route_dst_key(kind, target)
+            if dst is None:
+                continue
+            b.edge(src, dst, route["destination"], color=seg_color_for(dst))
+            if kind == "igw" and classify(rtb)[0] == "public":
+                b.edge(dst, src, f"inbound {subnet['cidr']}", color="#2563eb")
+            elif kind == "nat":
+                igw = next(
+                    (i for i in inv["igws"].values() if i["vpc_id"] == vpc_id and i["attached"]), None
+                )
                 if igw:
-                    b.edge("nat-" + target, "igw-" + igw["id"], "via public subnet")
-            elif kind == "vgw" and target:
-                b.edge(src, "vgw-" + target, label)
-            elif kind == "tgw" and target:
-                b.edge(src, "tgw-" + target, label)
-            elif kind == "pcx" and target:
-                b.edge(src, "pcx-" + target, label)
-            elif kind == "vpce" and target:
-                b.edge(src, "vpce-" + target, label)
+                    b.edge(dst, "igw-" + igw["id"], "via public subnet", color="#0e7490")
 
-    # IGW <-> internet
-    for igw in inv["igws"].values():
-        if igw["vpc_id"] == vpc_id:
-            b.edge("igw-" + igw["id"], "internet", "egress")
-            b.edge("internet", "igw-" + igw["id"], "ingress")
 
-    return b.render()
+def _emit_seg_rtb_nodes(b: Mermaid, inv: dict, subs: List[dict], vpc_rtbs: List[dict]) -> None:
+    by_rtb: Dict[str, List[dict]] = {}
+    for s in subs:
+        by_rtb.setdefault(s["rtb_id"], []).append(s)
+    for rtb in sorted(vpc_rtbs, key=lambda r: r["id"]):
+        members = by_rtb.get(rtb["id"], [])
+        if not members:
+            continue
+        cls, default = classify(rtb)
+        lines = [f"ROUTE TABLE {rtb['name'] or rtb['id']}", rtb["id"], classification_reason(cls, default)]
+        names = [s["name"] or s["id"] for s in members]
+        shown = ", ".join(names[:4]) + (f" (+{len(names) - 4})" if len(names) > 4 else "")
+        lines.append(f"{len(members)} subnet(s): {shown}")
+        nacl_ids = {(subnet_nacl(inv, s) or {}).get("id", "") for s in members}
+        if len(nacl_ids) == 1:
+            nacl = inv["nacls"].get(next(iter(nacl_ids)))
+            if nacl:
+                lines.append(f"nacl: {nacl['id']} ({nacl['in']} in / {nacl['out']} out)")
+        b.node("rtb-" + rtb["id"], "\n".join(lines), "subroutine", cls, 220)
+
+
+def _seg_rtb_edges(
+    b: Mermaid, inv: dict, vpc_id: str, subs: List[dict], vpc_rtbs: List[dict]
+) -> None:
+    by_rtb: Dict[str, List[dict]] = {}
+    for s in subs:
+        by_rtb.setdefault(s["rtb_id"], []).append(s)
+    for rtb in sorted(vpc_rtbs, key=lambda r: r["id"]):
+        if not by_rtb.get(rtb["id"]):
+            continue
+        src = "rtb-" + rtb["id"]
+        groups: Dict[str, dict] = {}
+        for route in rtb["routes"]:
+            if route["state"] != "active":
+                continue
+            dst = route_dst_key(route["kind"], route["target_id"])
+            if dst is None:
+                continue
+            group = groups.setdefault(dst, {"default": None, "others": []})
+            if route["destination"] in DEFAULT_ROUTES:
+                group["default"] = route
+            else:
+                group["others"].append(route)
+        for dst in sorted(groups):
+            b.edge(src, dst, agg_route_label(groups[dst]), color=seg_color_for(dst))
+            if dst.startswith("igw-") and classify(rtb)[0] == "public":
+                b.edge(dst, src, "inbound", color="#2563eb")
+            if dst.startswith("nat-"):
+                igw = next(
+                    (i for i in inv["igws"].values() if i["vpc_id"] == vpc_id and i["attached"]), None
+                )
+                if igw:
+                    b.edge(dst, "igw-" + igw["id"], "via public subnet", color="#0e7490")
 
 
 def _subnet_sort(inv: dict):
@@ -1007,13 +1195,17 @@ def _emit_comm_peer(b: Mermaid, inv: dict, key: str) -> None:
         b.node(key, cidr, "box", "cidr", 40)
 
 
-def render_vpc_comm(inv: dict, vpc_id: str) -> str:
-    """The whole app-to-app graph for one VPC, at security-group granularity.
+def render_vpc_comm(
+    inv: dict, vpc_id: str, focus_sg: str = "", detail: bool = False
+) -> str:
+    """The app-to-app graph for one VPC, at security-group granularity.
 
-    AWS security group references are always intra-VPC, so a VPC is a clean
-    partition: drawing the SG<->SG references of one VPC *is* the complete
-    "who can talk to whom" picture for that VPC, and it is small enough to load
-    in mermaid.live (SGs, not ENIs / instances / endpoints).
+    High detail (default): only security-group -> security-group references.
+    Low detail (``detail=True``): also the CIDR / prefix rules of the apps
+    already in the graph, so "this app allows the whole VPC / a peer network"
+    becomes a visible arrow instead of a CSV row.
+
+    ``focus_sg`` highlights that security group's arrows and dims the rest.
     """
     vpc = inv["vpcs"][vpc_id]
     sgs_here = {sg["id"]: sg for sg in inv["sgs"].values() if sg["vpc_id"] == vpc_id}
@@ -1022,43 +1214,86 @@ def render_vpc_comm(inv: dict, vpc_id: str) -> str:
     edges: List[Tuple[str, str, str]] = []
     seen: set = set()
 
+    def add(src: str, dst: str, label: str) -> None:
+        key = (src, dst, label)
+        if key in seen:
+            return
+        seen.add(key)
+        edges.append(key)
+
     def exposed(sg: dict) -> bool:
         return any(r["cidr"] in INTERNET_CIDRS for r in sg["ingress"])
 
+    # base graph: security-group -> security-group references (self-loops kept:
+    # an SG that references itself means its members may reach each other).
     for sg in sgs_here.values():
-        me = sg["id"]
+        me = "sg-" + sg["id"]
         for rule in sg["ingress"]:
             if rule["sg_id"] and rule["sg_id"] in sgs_here:
-                involved.add(me)
+                involved.add(sg["id"])
                 involved.add(rule["sg_id"])
-                key = (rule["sg_id"], me, port_label(rule))
-                if key not in seen:
-                    seen.add(key)
-                    edges.append(key)
+                add("sg-" + rule["sg_id"], me, port_label(rule))
         for rule in sg["egress"]:
             if rule["sg_id"] and rule["sg_id"] in sgs_here:
-                involved.add(me)
+                involved.add(sg["id"])
                 involved.add(rule["sg_id"])
-                key = (me, rule["sg_id"], port_label(rule))
-                if key not in seen:
-                    seen.add(key)
-                    edges.append(key)
+                add(me, "sg-" + rule["sg_id"], port_label(rule))
 
-    b = Mermaid(f"application communication \u2014 {vpc['name'] or vpc['id']} (security groups)")
+    # detail: the CIDR / prefix edges of the apps already in the graph. The
+    # universal egress-to-internet is skipped (it is on every SG and belongs to
+    # the exposure diagram), but ingress from anywhere, and egress to a specific
+    # network, are shown.
+    if detail:
+        for sg_id in sorted(involved):
+            sg = sgs_here[sg_id]
+            me = "sg-" + sg_id
+            for rule in sg["ingress"]:
+                if rule["cidr"]:
+                    add(cidr_key(rule["cidr"]), me, port_label(rule))
+                elif rule["prefix"]:
+                    add("pl-" + rule["prefix"], me, port_label(rule))
+            for rule in sg["egress"]:
+                if rule["cidr"] and rule["cidr"] not in INTERNET_CIDRS:
+                    add(me, cidr_key(rule["cidr"]), port_label(rule))
+                elif rule["prefix"]:
+                    add(me, "pl-" + rule["prefix"], port_label(rule))
+
+    focus_key = "sg-" + focus_sg if (focus_sg and focus_sg in sgs_here) else ""
+    if focus_key:
+        involved.add(focus_sg)
+
+    title = f"application communication \u2014 {vpc['name'] or vpc['id']} (security groups"
+    title += ", CIDR rules)" if detail else ")"
+    b = Mermaid(title)
+
     if not involved:
         b.node("none", "no security-group-to-security-group references in this VPC", "round", "private", 120)
         return b.render()
 
     for sg_id in sorted(involved):
         sg = sgs_here[sg_id]
+        if focus_key:
+            cls = "sghub" if "sg-" + sg_id == focus_key else "dim"
+        else:
+            cls = "exposed" if exposed(sg) else "sg"
         lines = [f"SG {sg['name']}", sg_id]
         members = inv["members"].get(sg_id, [])
         if members:
             lines.append(", ".join(members[:3]) + (" ..." if len(members) > 3 else ""))
-        b.node("sg-" + sg_id, "\n".join(lines), "stadium", "exposed" if exposed(sg) else "sg", 120)
+        b.node("sg-" + sg_id, "\n".join(lines), "stadium", cls, 120)
+
+    # non-SG peer nodes (CIDR / prefix / internet), defined before the arrows
+    for src, dst, _ in edges:
+        for key in (src, dst):
+            if key.startswith("sg-") or b.has(key):
+                continue
+            if key == "internet":
+                b.node(key, "INTERNET", "stadium", "internet")
+            else:
+                b.node(key, peer_label(key), "box", "cidr", 60)
 
     for src, dst, label in sorted(edges):
-        b.edge("sg-" + src, "sg-" + dst, label)
+        b.edge(src, dst, label, color=edge_color(src, dst, label, focus_key))
 
     return b.render()
 
@@ -1165,9 +1400,20 @@ def write_evidence(inv: dict, out: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def emit(inv: dict, out: str, sg_drilldowns: bool = False) -> Dict[str, int]:
+def emit(
+    inv: dict,
+    out: str,
+    granularity: str = "both",
+    focus_sg: str = "",
+    sg_drilldowns: bool = False,
+) -> Dict[str, int]:
     os.makedirs(out, exist_ok=True)
     link(inv)
+
+    seg_high = granularity in ("high", "both")
+    seg_low = granularity in ("low", "both")
+    comms_high = granularity in ("high", "both")
+    comms_low = granularity in ("low", "both")
 
     written: List[str] = []
 
@@ -1182,10 +1428,27 @@ def emit(inv: dict, out: str, sg_drilldowns: bool = False) -> Dict[str, int]:
 
     for vpc in sorted(inv["vpcs"].values(), key=lambda v: v["id"]):
         stem = slug(vpc["name"] or vpc["id"], 40)
-        save(f"10-seg-{stem}.mmd", render_vpc_seg(inv, vpc["id"]))
-        save(f"20-comms-{stem}.mmd", render_vpc_comm(inv, vpc["id"]))
+        if seg_high:
+            save(f"10-seg-{stem}.mmd", render_vpc_seg(inv, vpc["id"], "high"))
+        if seg_low:
+            save(f"10-seg-{stem}-detail.mmd", render_vpc_seg(inv, vpc["id"], "low"))
+        if comms_high:
+            save(f"20-comms-{stem}.mmd", render_vpc_comm(inv, vpc["id"], focus_sg, detail=False))
+        if comms_low:
+            save(
+                f"20-comms-{stem}-detail.mmd",
+                render_vpc_comm(inv, vpc["id"], focus_sg, detail=True),
+            )
 
     save("21-internet-exposure.mmd", render_exposure(inv))
+
+    if focus_sg:
+        sg = inv["sgs"].get(focus_sg)
+        if sg and sg["vpc_id"] in inv["vpcs"]:
+            save(
+                f"20-focus-{slug(sg['name'] or focus_sg, 40)}-{focus_sg}.mmd",
+                render_vpc_comm(inv, sg["vpc_id"], focus_sg=focus_sg, detail=True),
+            )
 
     if sg_drilldowns:
         edges_by_sg, sg_sg = build_comm_graph(inv)
@@ -1201,12 +1464,24 @@ def emit(inv: dict, out: str, sg_drilldowns: bool = False) -> Dict[str, int]:
             )
 
     write_evidence(inv, out)
-    write_start_here(inv, out, written, sg_drilldowns)
+    write_start_here(inv, out, written, granularity, focus_sg, sg_drilldowns)
 
-    return {"files": len(written), "vpcs": len(inv["vpcs"]), "drilldowns": sg_drilldowns}
+    return {
+        "files": len(written),
+        "vpcs": len(inv["vpcs"]),
+        "drilldowns": sg_drilldowns,
+        "granularity": granularity,
+    }
 
 
-def write_start_here(inv: dict, out: str, written: List[str], sg_drilldowns: bool) -> None:
+def write_start_here(
+    inv: dict,
+    out: str,
+    written: List[str],
+    granularity: str,
+    focus_sg: str,
+    sg_drilldowns: bool,
+) -> None:
     lines = [
         "# Start here",
         "",
@@ -1214,25 +1489,43 @@ def write_start_here(inv: dict, out: str, written: List[str], sg_drilldowns: boo
         f"- Regions: {', '.join(inv['regions']) or '-'}",
         f"- VPCs {len(inv['vpcs'])}, subnets {len(inv['subnets'])}, route tables {len(inv['rtbs'])}, "
         f"security groups {len(inv['sgs'])}, transit gateways {len(inv['tgws'])}, peerings {len(inv['peerings'])}",
+        f"- Granularity: **{granularity}** (high = route-table / SG-level, low = subnet / CIDR-level)",
         "",
         "The tool splits the network into **small, loadable** Mermaid diagrams:",
         "",
         "| Family | Files | Answers |",
         "| --- | --- | --- |",
         "| Overview | `00-overview.mmd` | The whole account: VPCs, TGWs, peerings, VPN. |",
-        "| Segmentation | `10-seg-*.mmd` | One per VPC. Subnets coloured public/private/isolated, "
-        "with route table + NACL + the default route that proves the tier. |",
-        "| Communication | `20-comms-*.mmd` | One per VPC, drawn at security-group level: the whole "
-        "app-to-app graph, with ports on the arrows. |",
+        "| Segmentation (high) | `10-seg-<vpc>.mmd` | One per VPC at **route-table level**: each route "
+        "table with its subnets, and one aggregated arrow per gateway target. Small and readable. |",
+        "| Segmentation (low) | `10-seg-<vpc>-detail.mmd` | One per VPC at **subnet level**: every subnet "
+        "and every route/CIDR drawn individually. The full detail. |",
+        "| Communication (high) | `20-comms-<vpc>.mmd` | One per VPC: security-group to security-group "
+        "references only, ports on the arrows. |",
+        "| Communication (low) | `20-comms-<vpc>-detail.mmd` | The same graph **plus the CIDR/prefix "
+        "rules**, so \"allows the whole VPC / a peer network\" is visible. |",
         "| Exposure | `21-internet-exposure.mmd` | Every security group with an ingress rule from "
         "0.0.0.0/0 or ::/0. |",
     ]
+    if focus_sg:
+        lines.append(
+            f"| Focus | `20-focus-*-{focus_sg}.mmd` | `--focus-sg {focus_sg}`: that security group's "
+            "arrows are highlighted (orange) and everything else is dimmed. |"
+        )
     if sg_drilldowns:
         lines.append(
             "| Drill-downs | `comms/<sg>-<id>.mmd` | One per security group (the `--sg-drilldowns` "
             "output): who can reach this one SG, and who it can reach. |"
         )
     lines += [
+        "",
+        "## Arrow colours",
+        "",
+        "- **red** = management (`:22`, `:3389`) or internet ingress",
+        "- **blue** = web (`:80`, `:443`)",
+        "- **green** = data stores (`:3306`, `:5432`, `:1521`, `:6379`, ...)",
+        "- **purple / pink / teal** (segmentation) = transit gateway / peering / endpoint",
+        "- **grey** = `all` / other",
         "",
         "## How to read a communication diagram",
         "",
@@ -1350,6 +1643,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--profile", default="", help="AWS profile name (default: the CloudShell session)")
     p.add_argument("--demo", action="store_true", help="run the bundled synthetic scenario (no AWS)")
     p.add_argument(
+        "--granularity",
+        choices=("high", "low", "both"),
+        default="both",
+        help="diagram detail (default: both). high = route-table segmentation + SG->SG comms; "
+        "low = per-subnet/per-CIDR + CIDR-rule comms; both = emit all four variants",
+    )
+    p.add_argument(
+        "--focus-sg",
+        default="",
+        help="highlight one security group's arrows (orange) and dim the rest",
+    )
+    p.add_argument(
         "--sg-drilldowns",
         action="store_true",
         help="additionally emit one per-security-group drill-down diagram under <out>/comms/",
@@ -1383,7 +1688,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         collector = Collector(regions, profile=args.profile)
         inv = collector.collect()
 
-    result = emit(inv, args.out, sg_drilldowns=args.sg_drilldowns)
+    result = emit(
+        inv,
+        args.out,
+        granularity=args.granularity,
+        focus_sg=args.focus_sg,
+        sg_drilldowns=args.sg_drilldowns,
+    )
 
     print("=" * 70)
     print(f"Account {inv['account_id'] or 'unknown'}  regions: {', '.join(inv['regions']) or '-'}")
@@ -1392,10 +1703,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"{len(inv['rtbs'])} route table(s), {len(inv['sgs'])} security group(s)"
     )
     print(
-        f"  written: {result['files']} file(s) \u2014 overview, {result['vpcs']} segmentation + "
-        f"{result['vpcs']} communication diagram(s), exposure, index"
-        + (" + SG drill-downs" if result["drilldowns"] else "")
+        f"  written: {result['files']} file(s) at granularity '{result['granularity']}' "
+        f"(overview, {result['vpcs']} seg + {result['vpcs']} comms per level, exposure, index"
+        + (" + SG drill-downs" if result["drilldowns"] else "") + ")"
     )
+    if args.focus_sg:
+        print(f"  focus: {args.focus_sg} (highlighted in 20-focus-*.mmd)")
     if inv["errors"]:
         print(f"  collection warnings: {len(inv['errors'])} (see START-HERE.md)")
     print(f"  output: {os.path.abspath(args.out)}")

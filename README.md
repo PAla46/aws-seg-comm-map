@@ -52,44 +52,64 @@ small.
 
 ```
 <out>/
-  00-overview.mmd            account overview: VPCs, TGWs, peerings, VPN
-  10-seg-<vpc>.mmd           one per VPC: subnet tiers + gateways + routes
-  20-comms-<vpc>.mmd         one per VPC: the SG-level app-to-app graph
-  21-internet-exposure.mmd   every SG reachable from 0.0.0.0/0 or ::/0
-  START-HERE.md              index + how to read each family
-  comms/<sg>-<id>.mmd        (only with --sg-drilldowns) one per security group
+  00-overview.mmd                 account overview: VPCs, TGWs, peerings, VPN
+  10-seg-<vpc>.mmd                HIGH: one per VPC, route-table level, aggregated arrows
+  10-seg-<vpc>-detail.mmd         LOW:  one per VPC, subnet level, every route/CIDR
+  20-comms-<vpc>.mmd              HIGH: one per VPC, SG -> SG references only
+  20-comms-<vpc>-detail.mmd       LOW:  one per VPC, SG -> SG plus CIDR rules
+  20-focus-<sg>-<id>.mmd          (only with --focus-sg) that SG highlighted
+  21-internet-exposure.mmd        every SG reachable from 0.0.0.0/0 or ::/0
+  START-HERE.md                   index + how to read each family
+  comms/<sg>-<id>.mmd             (only with --sg-drilldowns) one per security group
   reports/
-    subnets.csv              every subnet and its derived classification
-    route-tables.csv         every route, normalised
-    security-group-rules.csv every SG rule, flattened (the full evidence)
-    security-group-members.csv  which EC2/ALB/RDS/ENI uses each SG
+    subnets.csv                   every subnet and its derived classification
+    route-tables.csv              every route, normalised
+    security-group-rules.csv      every SG rule, flattened (the full evidence)
+    security-group-members.csv    which EC2/ALB/RDS/ENI uses each SG
 ```
 
-### `10-seg-*` — segmentation
+By default `--granularity both` emits the high and low variants of each family;
+`--granularity high` or `--granularity low` emits just one.
 
-Each subnet is a node, coloured by its **derived** tier, and the colour is
-backed by evidence in the label:
+### `10-seg-*` — segmentation (two granularities)
+
+- **High** (`10-seg-<vpc>.mmd`): one box per **route table** (listing its
+  subnets), one aggregated arrow per gateway target. This is what keeps a
+  16-subnet VPC from turning into a 40,000-px hairball.
+- **Low** (`10-seg-<vpc>-detail.mmd`): one node per **subnet**, one arrow per
+  route/CIDR. The full detail.
+
+Either way, each subnet/route table is coloured by its **derived** tier, and the
+colour is backed by evidence in the label:
 
 - `PUBLIC` (orange) — default route `0.0.0.0/0 → Internet Gateway`
 - `PRIVATE` (grey) — default route to NAT / TGW / VPN
 - `ISOLATED` (amber) — no default route at all
 
-The node also carries its route table and NACL, and arrows show
-`subnet → IGW/NAT/VGW/TGW/peering/endpoint` with the route that justifies each
-hop. Classification comes from the route table, never from the subnet name.
+Classification comes from the route table, never from the subnet name.
 
-### `20-comms-*` — application communication
+### `20-comms-*` — application communication (two granularities)
 
-One diagram per VPC, drawn at **security-group level** (not resource level), so
-it is small enough to load in mermaid.live while still showing the whole app
-graph. Each node is a security group; an arrow `A --> B :5432/tcp` means B's
-rules let A reach B on 5432 (or A's rules let A send to B). Red nodes are also
-reachable from the internet. Node labels list the EC2/ALB/RDS resources that use
-the group, so `sg-0abc…` reads as "the database tier".
+One diagram per VPC, drawn at **security-group level** (not resource level).
+Each node is a security group; an arrow `A --> B :5432/tcp` means B's rules let A
+reach B on 5432 (or A's rules let A send to B). Red nodes are reachable from the
+internet. Node labels list the EC2/ALB/RDS resources using the group, so
+`sg-0abc…` reads as "the database tier".
+
+- **High** (`20-comms-<vpc>.mmd`): security-group → security-group references only.
+- **Low** (`20-comms-<vpc>-detail.mmd`): the same graph **plus the CIDR/prefix
+  rules**, so "allows the whole VPC / a peer network" becomes a visible arrow.
 
 For a single-application zoom, `--sg-drilldowns` writes one `comms/<sg>-<id>.mmd`
-per security group: the hub node and its full neighbourhood (who can reach it
-*and* who it can reach).
+per security group, and `--focus-sg <id>` produces one diagram with that SG's
+arrows highlighted and everything else dimmed.
+
+### Arrow colours
+
+Edges are coloured semantically (a 58-SG graph cannot carry 58 colours):
+red = management/internet ingress, blue = web, green = data stores,
+purple/pink/teal = TGW/peering/endpoint, grey = `all`/other. With `--focus-sg`,
+the focus SG's arrows are orange and the rest dim grey.
 
 ### `21-internet-exposure`
 
@@ -109,6 +129,13 @@ python3 aws_seg_comm_map.py --regions eu-west-1,ap-south-1 --out ./map
 
 # a specific profile (CloudShell uses the session by default)
 python3 aws_seg_comm_map.py --all-regions --profile audit
+
+# only one granularity (default is 'both')
+python3 aws_seg_comm_map.py --all-regions --granularity high --out ./map
+python3 aws_seg_comm_map.py --all-regions --granularity low  --out ./map
+
+# trace one security group's arrows (highlighted, rest dimmed)
+python3 aws_seg_comm_map.py --all-regions --focus-sg sg-0123456789abcdef0 --out ./map
 
 # per-security-group drill-downs, too (a comms/<sg>-<id>.mmd per SG)
 python3 aws_seg_comm_map.py --all-regions --out ./map --sg-drilldowns
