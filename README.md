@@ -1,4 +1,4 @@
-# aws-seg-comm-map
+# dionysus
 
 Read-only AWS **network segmentation + application communication** mapper.
 
@@ -10,16 +10,16 @@ instantly, and each answering one of the two questions a segmentation audit
 asks.
 
 ```bash
-git clone https://github.com/PAla46/aws-seg-comm-map.git
-cd aws-seg-comm-map
-python3 aws_seg_comm_map.py --all-regions --out ./seg-comm-map
+git clone https://github.com/PAla46/dionysus.git
+cd dionysus
+python3 dionysus.py --all-regions --out ./seg-comm-map
 ```
 
 Then paste any `*.mmd` file from `seg-comm-map/` into
 <https://mermaid.live>. Start with `START-HERE.md`.
 
 It only calls `Describe*` / `List*` APIs. It never creates, modifies or deletes
-anything. It is a single file (`aws_seg_comm_map.py`) with no dependency beyond
+anything. It is a single file (`dionysus.py`) with no dependency beyond
 `boto3` (preinstalled on AWS CloudShell).
 
 ---
@@ -122,26 +122,26 @@ open ports. This is usually the first thing an auditor looks at.
 
 ```bash
 # every enabled region
-python3 aws_seg_comm_map.py --all-regions --out ./seg-comm-map
+python3 dionysus.py --all-regions --out ./seg-comm-map
 
 # specific regions
-python3 aws_seg_comm_map.py --regions eu-west-1,ap-south-1 --out ./map
+python3 dionysus.py --regions eu-west-1,ap-south-1 --out ./map
 
 # a specific profile (CloudShell uses the session by default)
-python3 aws_seg_comm_map.py --all-regions --profile audit
+python3 dionysus.py --all-regions --profile audit
 
 # only one granularity (default is 'both')
-python3 aws_seg_comm_map.py --all-regions --granularity high --out ./map
-python3 aws_seg_comm_map.py --all-regions --granularity low  --out ./map
+python3 dionysus.py --all-regions --granularity high --out ./map
+python3 dionysus.py --all-regions --granularity low  --out ./map
 
 # trace one security group's arrows (highlighted, rest dimmed)
-python3 aws_seg_comm_map.py --all-regions --focus-sg sg-0123456789abcdef0 --out ./map
+python3 dionysus.py --all-regions --focus-sg sg-0123456789abcdef0 --out ./map
 
 # per-security-group drill-downs, too (a comms/<sg>-<id>.mmd per SG)
-python3 aws_seg_comm_map.py --all-regions --out ./map --sg-drilldowns
+python3 dionysus.py --all-regions --out ./map --sg-drilldowns
 
 # no AWS? verify the tool works first:
-python3 aws_seg_comm_map.py --demo --out ./demo
+python3 dionysus.py --demo --out ./demo
 ```
 
 ### Permissions (read-only)
