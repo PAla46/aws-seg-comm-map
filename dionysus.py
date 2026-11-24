@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""AWS network segmentation + application communication mapper.
+"""Dionysus \u2014 AWS network segmentation + application communication mapper.
 
 Read-only. Runs straight from a clone on AWS CloudShell (boto3 is preinstalled):
 
-    git clone https://github.com/PAla46/aws-seg-comm-map.git
-    cd aws-seg-comm-map
-    python3 aws_seg_comm_map.py --all-regions --out ./seg-comm-map
+    git clone https://github.com/PAla46/dionysus.git
+    cd dionysus
+    python3 dionysus.py --all-regions --out ./seg-comm-map
 
 It answers the two questions a network segmentation audit asks, and it answers
 them with *separate* diagrams because the single "whole account" topology is
@@ -1259,13 +1259,13 @@ def build_demo() -> dict:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="aws-seg-comm-map",
+        prog="dionysus",
         description="Read-only AWS network segmentation + application communication mapper "
         "(multiple small Mermaid .mmd files, one per VPC and per security group).",
         epilog="examples:\n"
-        "  python3 aws_seg_comm_map.py --all-regions --out ./seg-comm-map\n"
-        "  python3 aws_seg_comm_map.py --regions eu-west-1,us-east-1\n"
-        "  python3 aws_seg_comm_map.py --demo --out ./demo   # no AWS calls",
+        "  python3 dionysus.py --all-regions --out ./seg-comm-map\n"
+        "  python3 dionysus.py --regions eu-west-1,us-east-1\n"
+        "  python3 dionysus.py --demo --out ./demo   # no AWS calls",
     )
     p.add_argument("--regions", default="", help="comma separated region list")
     p.add_argument("--all-regions", action="store_true", help="scan every enabled region")
